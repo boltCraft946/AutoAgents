@@ -29,6 +29,7 @@ use std::sync::Arc;
 #[derive(Debug, Default, Clone)]
 pub struct OpenAIConfig {
     pub voice: Option<String>,
+    pub wire_api: Option<String>,
 }
 
 /// Internal OpenAI provider config (for OpenAICompatibleProvider)
@@ -50,6 +51,7 @@ impl OpenAIProviderConfig for OpenAIInternalCfg {
 pub struct OpenAI {
     // Delegate to the generic provider for common functionality
     provider: OpenAICompatibleProvider<OpenAIInternalCfg>,
+    pub wire_api: Option<String>,
     pub enable_web_search: bool,
     pub web_search_context_size: Option<String>,
     pub web_search_user_location_type: Option<String>,
@@ -59,7 +61,7 @@ pub struct OpenAI {
 }
 
 /// OpenAI-specific tool that can be either a function tool or a web search tool
-#[derive(Serialize, Debug)]
+#[derive(Serialize, Debug, Clone)]
 #[serde(untagged)]
 pub enum OpenAITool {
     Function {
@@ -127,7 +129,7 @@ impl ChatResponse for OpenAIWebSearchChatResponse {
     }
 }
 
-#[derive(Deserialize, Debug, Serialize)]
+#[derive(Deserialize, Debug, Serialize, Clone)]
 pub struct UserLocation {
     #[serde(rename = "type")]
     pub location_type: String,
@@ -135,7 +137,7 @@ pub struct UserLocation {
     pub approximate: Option<ApproximateLocation>,
 }
 
-#[derive(Deserialize, Debug, Serialize)]
+#[derive(Deserialize, Debug, Serialize, Clone)]
 pub struct ApproximateLocation {
     pub country: String,
     pub city: String,
@@ -149,7 +151,7 @@ pub struct OpenAIAPIChatRequest<'a> {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub messages: Vec<OpenAIChatMessage<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub input: Option<String>,
+    pub input: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_completion_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -176,6 +178,57 @@ pub struct OpenAIAPIChatRequest<'a> {
 }
 
 impl OpenAI {
+    fn use_responses_wire_api(&self) -> bool {
+        matches!(self.wire_api.as_deref(), Some("responses"))
+    }
+
+    fn responses_input_from_messages(
+        &self,
+        messages: &[ChatMessage],
+    ) -> Result<serde_json::Value, LLMError> {
+        let items = messages
+            .iter()
+            .map(|message| {
+                let role = match message.role {
+                    crate::chat::ChatRole::System => "system",
+                    crate::chat::ChatRole::User => "user",
+                    crate::chat::ChatRole::Assistant => "assistant",
+                    crate::chat::ChatRole::Tool => "tool",
+                };
+
+                let content = match &message.message_type {
+                    crate::chat::MessageType::Text => serde_json::json!([{
+                        "type": "input_text",
+                        "text": message.content
+                    }]),
+                    crate::chat::MessageType::ToolUse(tool_calls)
+                    | crate::chat::MessageType::ToolResult(tool_calls) => {
+                        let text = serde_json::to_string(tool_calls).map_err(LLMError::from)?;
+                        serde_json::json!([{
+                            "type": "input_text",
+                            "text": text
+                        }])
+                    }
+                    crate::chat::MessageType::Image(_)
+                    | crate::chat::MessageType::Pdf(_)
+                    | crate::chat::MessageType::ImageURL(_) => {
+                        return Err(LLMError::InvalidRequest(
+                            "OpenAI responses wire_api currently supports text and tool messages only"
+                                .to_string(),
+                        ));
+                    }
+                };
+
+                Ok(serde_json::json!({
+                    "role": role,
+                    "content": content
+                }))
+            })
+            .collect::<Result<Vec<_>, LLMError>>()?;
+
+        Ok(serde_json::Value::Array(items))
+    }
+
     /// Creates a new OpenAI client with the specified configuration.
     ///
     /// # Arguments
@@ -242,6 +295,7 @@ impl OpenAI {
                 embedding_encoding_format,
                 embedding_dimensions,
             ),
+            wire_api: None,
             enable_web_search: enable_web_search.unwrap_or(false),
             web_search_context_size,
             web_search_user_location_type,
@@ -308,7 +362,7 @@ impl ChatProvider for OpenAI {
             extra_body: self.provider.extra_body.clone(),
         };
         if self.should_use_responses_endpoint_for_chat() {
-            return self.chat_with_responses_endpoint(&body).await;
+            return self.chat_with_responses_endpoint(messages, &body).await;
         }
         let url = self
             .provider
@@ -341,7 +395,7 @@ impl ChatProvider for OpenAI {
                 log::debug!(
                     "OpenAI chat/completions returned Invalid client; retrying with /responses endpoint"
                 );
-                return self.chat_with_responses_endpoint(&body).await;
+                return self.chat_with_responses_endpoint(messages, &body).await;
             }
             return Err(LLMError::ResponseFormatError {
                 message: format!("OpenAI API returned error status: {status}"),
@@ -608,7 +662,7 @@ impl OpenAI {
         let body = OpenAIAPIChatRequest {
             model: self.provider.model.as_str(),
             messages: Vec::new(), // Empty for hosted tools
-            input: Some(input),
+            input: Some(serde_json::Value::String(input)),
             max_completion_tokens: None,
             max_output_tokens: self.provider.max_tokens,
             temperature: self.provider.temperature,
@@ -671,6 +725,7 @@ impl OpenAI {
 
     async fn chat_with_responses_endpoint(
         &self,
+        messages: &[ChatMessage],
         body: &OpenAIAPIChatRequest<'_>,
     ) -> Result<Box<dyn ChatResponse>, LLMError> {
         let url = self
@@ -684,7 +739,23 @@ impl OpenAI {
             .client
             .post(url)
             .bearer_auth(&self.provider.api_key)
-            .json(body);
+            .json(&OpenAIAPIChatRequest {
+                model: body.model,
+                messages: Vec::new(),
+                input: Some(self.responses_input_from_messages(messages)?),
+                max_completion_tokens: None,
+                max_output_tokens: body.max_completion_tokens,
+                temperature: body.temperature,
+                stream: body.stream,
+                top_p: body.top_p,
+                top_k: body.top_k,
+                tools: body.tools.clone(),
+                tool_choice: body.tool_choice.clone(),
+                reasoning_effort: body.reasoning_effort.clone(),
+                response_format: body.response_format.clone(),
+                stream_options: body.stream_options.clone(),
+                extra_body: body.extra_body.clone(),
+            });
 
         if let Some(timeout) = self.provider.timeout_seconds {
             request = request.timeout(std::time::Duration::from_secs(timeout));
@@ -713,7 +784,7 @@ impl OpenAI {
     }
 
     fn should_use_responses_endpoint_for_chat(&self) -> bool {
-        self.provider.base_url.host_str() == Some("api.openai.com")
+        self.use_responses_wire_api() || self.provider.base_url.host_str() == Some("api.openai.com")
     }
 }
 
@@ -724,11 +795,16 @@ impl LLMBuilder<OpenAI> {
         self
     }
 
+    pub fn wire_api(mut self, wire_api: impl Into<String>) -> Self {
+        self.config.wire_api = Some(wire_api.into());
+        self
+    }
+
     pub fn build(self) -> Result<Arc<OpenAI>, LLMError> {
         let key = self.api_key.ok_or_else(|| {
             LLMError::InvalidRequest("No API key provided for OpenAI".to_string())
         })?;
-        let openai = OpenAI::new(
+        let mut openai = OpenAI::new(
             key,
             self.base_url,
             self.model,
@@ -751,6 +827,8 @@ impl LLMBuilder<OpenAI> {
             None,
             None,
         )?;
+
+        openai.wire_api = self.config.wire_api;
 
         Ok(Arc::new(openai))
     }

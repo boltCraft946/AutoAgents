@@ -164,7 +164,7 @@ pub struct OpenAIChatMsg {
     pub tool_calls: Option<Vec<ToolCall>>,
 }
 
-#[derive(Deserialize, Debug, Serialize)]
+#[derive(Deserialize, Debug, Serialize, Clone)]
 pub enum OpenAIResponseType {
     #[serde(rename = "text")]
     Text,
@@ -174,7 +174,7 @@ pub enum OpenAIResponseType {
     JsonObject,
 }
 
-#[derive(Deserialize, Debug, Serialize)]
+#[derive(Deserialize, Debug, Serialize, Clone)]
 pub struct OpenAIResponseFormat {
     #[serde(rename = "type")]
     pub response_type: OpenAIResponseType,
@@ -182,7 +182,7 @@ pub struct OpenAIResponseFormat {
     pub json_schema: Option<StructuredOutputFormat>,
 }
 
-#[derive(Deserialize, Debug, Serialize)]
+#[derive(Deserialize, Debug, Serialize, Clone)]
 pub struct OpenAIStreamOptions {
     pub include_usage: bool,
 }
