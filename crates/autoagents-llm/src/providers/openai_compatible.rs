@@ -423,6 +423,13 @@ impl<T: OpenAIProviderConfig> ChatProvider for OpenAICompatibleProvider<T> {
         } else {
             None
         };
+
+        {
+            // Debug msg
+            let msg = serde_json::to_string(&openai_msgs).unwrap();
+            log::info!("SerdeToJsonToPostOpenAICompatible msg: {}", msg)
+        }
+
         let body = OpenAIChatRequest {
             model: &self.model,
             messages: openai_msgs,
